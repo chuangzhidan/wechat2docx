@@ -10,6 +10,10 @@ wechat2docx_app.py - 微信/CSDN 文章转 Word/Markdown，Word 转 Markdown Web
 import sys
 import tempfile
 import os
+import threading
+import uuid
+import traceback
+from pathlib import Path
 from urllib.parse import quote
 from flask import Flask, request, jsonify, render_template_string
 
@@ -20,8 +24,82 @@ from wechat2docx import (
   build_docx,
   SUPPORTED_BODY_FONTS,
 )
+import video_download
 
 app = Flask(__name__)
+
+# ——————————————————— 视频下载：轻量任务系统 ———————————————————
+# 视频下载是分钟级长任务，不能像文章转换那样同步阻塞返回。
+# 这里用内存 dict + 后台线程 + 前端轮询 实现进度反馈（精简自 bilibili 工具）。
+
+DOWNLOAD_DIR = Path(__file__).resolve().parent / "downloads"
+VIDEO_JOBS: dict[str, dict] = {}
+VIDEO_JOBS_LOCK = threading.Lock()
+
+
+def _new_video_job(payload: dict) -> dict:
+    job_id = uuid.uuid4().hex[:12]
+    job = {
+        "id": job_id,
+        "status": "queued",          # queued / running / completed / failed
+        "stage": "排队中",
+        "percent": 0.0,
+        "title": payload.get("title") or "video",
+        "error": "",
+        "outName": "",
+        "logs": [],
+    }
+    with VIDEO_JOBS_LOCK:
+        VIDEO_JOBS[job_id] = job
+    return job
+
+
+def _update_video_job(job_id: str, *, log: str | None = None, **changes) -> None:
+    with VIDEO_JOBS_LOCK:
+        job = VIDEO_JOBS.get(job_id)
+        if not job:
+            return
+        job.update(changes)
+        if log:
+            job["logs"].append(log)
+            job["logs"] = job["logs"][-60:]
+
+
+def _run_video_job(job_id: str, payload: dict) -> None:
+    _update_video_job(job_id, status="running", stage="准备中", percent=1.0)
+
+    def on_progress(percent, stage, log):
+        changes = {"stage": stage}
+        if percent is not None:
+            changes["percent"] = percent
+        _update_video_job(job_id, log=log, **changes)
+
+    try:
+        out_path = video_download.download_m3u8(
+            payload["m3u8"],
+            DOWNLOAD_DIR,
+            title=payload.get("title") or "video",
+            cookie=payload.get("cookie", ""),
+            referer=payload.get("referer", ""),
+            on_progress=on_progress,
+        )
+        _update_video_job(
+            job_id,
+            status="completed",
+            stage="视频已保存",
+            percent=100.0,
+            outName=out_path.name,
+            log=f"完成：{out_path}",
+        )
+    except Exception as e:  # noqa: BLE001
+        traceback.print_exc(file=sys.stderr)
+        _update_video_job(
+            job_id,
+            status="failed",
+            stage="下载失败",
+            error=str(e),
+            log=f"错误：{e}",
+        )
 
 HTML = """
 <!DOCTYPE html>
@@ -151,6 +229,28 @@ HTML = """
     }
     @keyframes spin { to { transform: rotate(360deg); } }
 
+    /* Video progress */
+    textarea {
+      width: 100%; padding: 11px 13px; border: 1.5px solid #d0d7de;
+      border-radius: 10px; font-size: 13px; color: #1a1a1a; outline: none;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      resize: vertical; min-height: 60px; transition: border-color .2s;
+    }
+    textarea:focus { border-color: #07c160; }
+    .progress-wrap { display: none; margin-top: 16px; }
+    .progress-wrap.show { display: block; }
+    .progress-bar { height: 10px; background: #eef1f4; border-radius: 6px; overflow: hidden; }
+    .progress-bar > span {
+      display: block; height: 100%; width: 0%; background: #07c160;
+      border-radius: 6px; transition: width .4s ease;
+    }
+    .progress-stage { font-size: 13px; color: #555; margin-top: 8px; font-weight: 600; }
+    .video-log {
+      margin-top: 10px; max-height: 140px; overflow-y: auto;
+      background: #0d1117; color: #9ed6b8; border-radius: 8px; padding: 10px 12px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px;
+      line-height: 1.7; white-space: pre-wrap; word-break: break-all;
+    }
     .divider { border: none; border-top: 1px solid #eee; margin: 24px 0; }
     .features { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
     .feature-item { display: flex; align-items: flex-start; gap: 8px; font-size: 13px; color: #555; }
@@ -175,6 +275,7 @@ HTML = """
   <div class="tabs">
     <div class="tab active" data-tab="url">🌐 URL 转文档</div>
     <div class="tab" data-tab="upload">📄 Word → Markdown</div>
+    <div class="tab" data-tab="video">🎬 视频下载</div>
   </div>
 
   <!-- Panel 1: URL 转 Word / MD -->
@@ -246,6 +347,49 @@ HTML = """
       <span id="upload-btn-text">转换为 Markdown</span>
     </button>
     <div id="msg-upload"></div>
+  </div>
+
+  <!-- Panel 3: 视频下载（小鹅通等加密 m3u8） -->
+  <div class="panel" id="panel-video">
+    <label for="video-title">文件名（可选）</label>
+    <div class="input-row" style="margin-bottom:14px;">
+      <input id="video-title" type="text" placeholder="例如：第1课-导论" autocomplete="off">
+    </div>
+
+    <label for="video-m3u8">m3u8 地址</label>
+    <div style="margin-bottom:14px;">
+      <textarea id="video-m3u8" placeholder="粘贴在浏览器抓到的真实 .m3u8 地址（https://...）"></textarea>
+    </div>
+
+    <details style="margin-bottom:14px;">
+      <summary style="font-size:13px;color:#07c160;cursor:pointer;font-weight:600;">高级（需要登录态时填 Cookie / Referer）</summary>
+      <div style="margin-top:12px;">
+        <label for="video-cookie" style="font-size:13px;">Cookie（可选）</label>
+        <div style="margin-bottom:12px;">
+          <textarea id="video-cookie" placeholder="若 m3u8 / key 需要登录，把页面的 Cookie 粘进来"></textarea>
+        </div>
+        <label for="video-referer" style="font-size:13px;">Referer（可选）</label>
+        <div class="input-row">
+          <input id="video-referer" type="text" placeholder="例如：https://xxx.h5.xiaoecloud.com/" autocomplete="off">
+        </div>
+      </div>
+    </details>
+
+    <button class="btn-primary" id="video-btn" type="button">
+      <div class="spinner" id="video-spinner"></div>
+      <svg id="video-icon" viewBox="0 0 24 24"><path d="M5 20h14v-2H5v2zm7-18L5.33 10h4.34v6h4.66v-6h4.34L12 2z"/></svg>
+      <span id="video-btn-text">开始下载</span>
+    </button>
+
+    <div class="progress-wrap" id="video-progress">
+      <div class="progress-bar"><span id="video-bar"></span></div>
+      <div class="progress-stage" id="video-stage">准备中…</div>
+      <div class="video-log" id="video-loglines"></div>
+    </div>
+
+    <div id="msg-video"></div>
+
+    <p class="hint">仅用于下载你<b>已登录 / 已购</b>的内容。真实 m3u8 地址需在浏览器里抓取（F12 → Network → 过滤 m3u8，或用一键脚本）。优先 ffmpeg 直下，失败自动回退 AES 解密。</p>
   </div>
 
 </div>
@@ -487,6 +631,115 @@ uploadBtn.addEventListener('click', async () => {
     uploadBtnTxt.textContent = '转换为 Markdown';
   }
 });
+
+// ——— 视频下载 ———
+const videoBtn      = document.getElementById('video-btn');
+const videoSpinner  = document.getElementById('video-spinner');
+const videoIcon     = document.getElementById('video-icon');
+const videoBtnTxt   = document.getElementById('video-btn-text');
+const videoM3u8     = document.getElementById('video-m3u8');
+const videoCookie   = document.getElementById('video-cookie');
+const videoReferer  = document.getElementById('video-referer');
+const videoTitle    = document.getElementById('video-title');
+const msgVideo      = document.getElementById('msg-video');
+const videoProgress = document.getElementById('video-progress');
+const videoBar      = document.getElementById('video-bar');
+const videoStage    = document.getElementById('video-stage');
+const videoLogLines = document.getElementById('video-loglines');
+let videoPoll = null;
+
+function _setVideoBusy(busy) {
+  videoBtn.disabled = busy;
+  videoSpinner.style.display = busy ? 'block' : 'none';
+  videoIcon.style.display = busy ? 'none' : 'block';
+  videoBtnTxt.textContent = busy ? '下载中…' : '开始下载';
+}
+
+videoBtn.addEventListener('click', async () => {
+  const m3u8 = videoM3u8.value.trim();
+  if (!m3u8) { videoM3u8.focus(); return; }
+  if (videoPoll) { clearInterval(videoPoll); videoPoll = null; }
+
+  _setVideoBusy(true);
+  msgVideo.className = ''; msgVideo.textContent = '';
+  videoProgress.classList.add('show');
+  videoBar.style.width = '0%';
+  videoStage.textContent = '提交任务…';
+  videoLogLines.textContent = '';
+
+  try {
+    const resp = await fetch('/api/video/jobs', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        m3u8,
+        cookie: videoCookie.value.trim(),
+        referer: videoReferer.value.trim(),
+        title: videoTitle.value.trim(),
+      }),
+    });
+    if (!resp.ok) {
+      const data = await resp.json().catch(() => ({ error: resp.statusText }));
+      showMsg(msgVideo, 'error', '❌ ' + (data.error || '提交失败'));
+      _setVideoBusy(false);
+      return;
+    }
+    const { id } = await resp.json();
+    videoPoll = setInterval(() => _pollVideo(id), 800);
+  } catch (err) {
+    showMsg(msgVideo, 'error', '❌ 网络错误：' + err.message);
+    _setVideoBusy(false);
+  }
+});
+
+async function _pollVideo(id) {
+  try {
+    const resp = await fetch('/api/video/jobs/' + id);
+    if (!resp.ok) return;
+    const job = await resp.json();
+    if (typeof job.percent === 'number') videoBar.style.width = job.percent + '%';
+    videoStage.textContent = job.stage + (typeof job.percent === 'number' ? '  ' + job.percent.toFixed(1) + '%' : '');
+    if (job.logs && job.logs.length) {
+      videoLogLines.textContent = job.logs.join('\\n');
+      videoLogLines.scrollTop = videoLogLines.scrollHeight;
+    }
+    if (job.status === 'completed') {
+      clearInterval(videoPoll); videoPoll = null;
+      _setVideoBusy(false);
+      videoBar.style.width = '100%';
+      showMsg(msgVideo, 'success', '✅ 下载完成，正在保存到本地…');
+      const a = document.createElement('a');
+      a.href = '/api/video/file/' + id;
+      a.download = '';
+      document.body.appendChild(a); a.click(); a.remove();
+    } else if (job.status === 'failed') {
+      clearInterval(videoPoll); videoPoll = null;
+      _setVideoBusy(false);
+      showMsg(msgVideo, 'error', '❌ ' + (job.error || '下载失败'));
+    }
+  } catch (_) { /* 网络抖动，下次轮询继续 */ }
+}
+
+// ——— 油猴脚本一键唤起：?m3u8=...&title=...&referer=... 自动填入并开始 ———
+(function _autoFromQuery() {
+  const q = new URLSearchParams(location.search);
+  const m3u8 = q.get('m3u8');
+  if (!m3u8) return;
+  // 切到视频标签
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+  document.querySelector('.tab[data-tab="video"]').classList.add('active');
+  document.getElementById('panel-video').classList.add('active');
+  // 填入参数
+  videoM3u8.value = m3u8;
+  if (q.get('title')) videoTitle.value = q.get('title');
+  if (q.get('referer')) videoReferer.value = q.get('referer');
+  if (q.get('cookie')) videoCookie.value = q.get('cookie');
+  // 清掉地址栏参数，避免刷新重复触发
+  history.replaceState(null, '', location.pathname);
+  // 自动开始下载
+  setTimeout(() => videoBtn.click(), 300);
+})();
 </script>
 </body>
 </html>
@@ -685,6 +938,84 @@ def _docx_to_md(docx_path: str) -> str:
 
     print(f"  [docx→md] {img_counter[0]} 张图片，{len(lines)} 个段落", file=sys.stderr)
     return "\n\n".join(lines)
+
+
+@app.get("/xiaoe_capture.user.js")
+def serve_userscript():
+    """提供油猴脚本：浏览器访问此网址，Tampermonkey 会自动弹出安装页。"""
+    from flask import Response
+
+    js_path = Path(__file__).resolve().parent / "browser_helper" / "xiaoe_capture.user.js"
+    if not js_path.exists():
+        return jsonify({"error": "脚本文件不存在"}), 404
+    return Response(
+        js_path.read_text(encoding="utf-8"),
+        content_type="text/javascript; charset=utf-8",
+    )
+
+
+@app.post("/api/video/jobs")
+def video_create_job():
+    data = request.get_json(silent=True) or {}
+    m3u8 = (data.get("m3u8") or "").strip()
+    if not m3u8:
+        return jsonify({"error": "请粘贴 m3u8 地址"}), 400
+    if "m3u8" not in m3u8.lower():
+        return jsonify({"error": "这看起来不是 m3u8 播放列表地址"}), 400
+    if not (m3u8.startswith("http://") or m3u8.startswith("https://")):
+        return jsonify({"error": "m3u8 地址必须以 http(s):// 开头"}), 400
+
+    payload = {
+        "m3u8": m3u8,
+        "cookie": (data.get("cookie") or "").strip(),
+        "referer": (data.get("referer") or "").strip(),
+        "title": (data.get("title") or "").strip() or "video",
+    }
+    job = _new_video_job(payload)
+    thread = threading.Thread(target=_run_video_job, args=(job["id"], payload), daemon=True)
+    thread.start()
+    return jsonify({"id": job["id"]}), 202
+
+
+@app.get("/api/video/jobs/<job_id>")
+def video_job_status(job_id):
+    with VIDEO_JOBS_LOCK:
+        job = VIDEO_JOBS.get(job_id)
+        if not job:
+            return jsonify({"error": "任务不存在"}), 404
+        return jsonify(dict(job))
+
+
+@app.get("/api/video/file/<job_id>")
+def video_job_file(job_id):
+    from flask import Response
+
+    with VIDEO_JOBS_LOCK:
+        job = VIDEO_JOBS.get(job_id)
+        if not job:
+            return jsonify({"error": "任务不存在"}), 404
+        if job["status"] != "completed" or not job["outName"]:
+            return jsonify({"error": "视频尚未下载完成"}), 400
+        out_name = job["outName"]
+
+    file_path = (DOWNLOAD_DIR / out_name).resolve()
+    # 防目录穿越：必须落在 DOWNLOAD_DIR 内
+    if DOWNLOAD_DIR.resolve() not in file_path.parents or not file_path.exists():
+        return jsonify({"error": "文件不存在"}), 404
+
+    encoded = quote(out_name, safe="")
+    mimetype = "video/mp4" if file_path.suffix == ".mp4" else "video/mp2t"
+    with open(file_path, "rb") as f:
+        data = f.read()
+    return Response(
+        data,
+        mimetype=mimetype,
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="video{file_path.suffix}"; filename*=UTF-8\'\'{encoded}'
+            )
+        },
+    )
 
 
 if __name__ == "__main__":

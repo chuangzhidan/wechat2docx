@@ -1,0 +1,19 @@
+# 文章抓取 / 文档生成
+requests>=2.31
+beautifulsoup4>=4.12
+python-docx>=1.0
+pillow>=10.0
+
+# 公式渲染（matplotlib mathtext + MathJax SVG）
+matplotlib>=3.7
+resvg-py>=0.1
+
+# Web 界面
+flask>=3.0
+
+# 通用文件转 Markdown（doc2md.py）
+markitdown>=0.0.1
+
+# 视频下载（视频下载标签页）—— AES m3u8 兜底解密
+# 主路径用系统 ffmpeg；以下仅在 ffmpeg 直下失败时的纯 Python 兜底用到
+pycryptodome>=3.20
