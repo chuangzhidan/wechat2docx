@@ -1,0 +1,16 @@
+# 敏感文件 —— 不要提交
+*.pem
+.xueqiu_state/
+*.log
+
+# Python 缓存与产物
+__pycache__/
+*.pyc
+*.pyo
+output/
+
+# 系统/编辑器
+.DS_Store
+.venv/
+.idea/
+.vscode/
