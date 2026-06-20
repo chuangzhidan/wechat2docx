@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         小鹅通视频一键抓取 → 本地下载
 // @namespace    wechat2docx.video
-// @version      0.2.2
-// @description  在小鹅通播放页拦截真实 m3u8 地址，一键发送到本地 wechat2docx 工具下载为 mp4。支持 iframe 播放器与白标域名。仅用于下载你已登录/已购的内容。
+// @version      0.2.3
+// @description  在小鹅通播放页拦截真实 m3u8 地址，一键发送到本地 wechat2docx 工具下载为 mp4。精准识别真实播放列表（含从上报地址中抽取内嵌 play_url），支持 iframe 与白标域名。仅用于下载你已登录/已购的内容。
 // @author       wechat2docx
 // @match        *://*.xiaoecloud.com/*
 // @match        *://*.xiaoe-tech.com/*
@@ -24,18 +24,34 @@
 
   const isTop = (window.top === window.self);
 
+  // 从任意 URL 中提取"真实 m3u8 播放列表"：
+  //  1) 路径本身以 .m3u8 结尾 → 直接用
+  //  2) 否则（如埋点/上报地址）从其 query 参数里抽出内嵌的 play_url（值是一条 .m3u8）
+  function extractM3u8(raw) {
+    if (!raw || typeof raw !== 'string') return null;
+    let u;
+    try { u = new URL(raw, location.href); } catch (_) { return null; }
+    if (u.pathname.toLowerCase().endsWith('.m3u8')) return u.href;
+    for (const v of u.searchParams.values()) {
+      if (v && v.toLowerCase().indexOf('.m3u8') !== -1) {
+        try {
+          const inner = new URL(v);
+          if (inner.pathname.toLowerCase().endsWith('.m3u8')) return inner.href;
+        } catch (_) { /* 该参数不是合法 URL，跳过 */ }
+      }
+    }
+    return null;
+  }
+
   // ——————— 抓取逻辑（所有 frame 都跑）———————
   function reportUrl(url) {
-    try {
-      if (!url || typeof url !== 'string' || url.indexOf('.m3u8') === -1) return;
-      const abs = new URL(url, location.href).href;
-      if (isTop) {
-        onCaptured(abs, document.title);
-      } else {
-        // 子 frame：把捕获结果发给顶层页面
-        window.top.postMessage({ tag: MSG_TAG, url: abs, title: document.title }, '*');
-      }
-    } catch (_) { /* 忽略非法 URL / 跨域限制 */ }
+    const m3u8 = extractM3u8(url);
+    if (!m3u8) return;
+    if (isTop) {
+      onCaptured(m3u8, document.title);
+    } else {
+      try { window.top.postMessage({ tag: MSG_TAG, url: m3u8, title: document.title }, '*'); } catch (_) {}
+    }
   }
 
   // Hook XMLHttpRequest
@@ -58,8 +74,7 @@
   const scanTimer = setInterval(() => {
     try {
       const entries = performance.getEntriesByType('resource') || [];
-      for (const e of entries) if (e.name && e.name.indexOf('.m3u8') !== -1) reportUrl(e.name);
-      // 同时扫一下 video/source 标签的 src
+      for (const e of entries) if (e.name) reportUrl(e.name);
       document.querySelectorAll('video[src],source[src]').forEach(v => reportUrl(v.src));
     } catch (_) {}
     if (++scanCount > 40) clearInterval(scanTimer);  // 约 60 秒后停止扫描
@@ -68,8 +83,9 @@
   // ——————— 顶层页面：UI + 收集 ———————
   if (!isTop) return;  // 子 frame 到此为止，只负责抓取并上报
 
-  const captured = [];
-  const seen = new Set();
+  // 按"路径"去重：同一视频被不同签名多次请求时，只保留最新一条（签名最新鲜）
+  const byKey = new Map();
+  let captured = [];
   let box = null;
 
   window.addEventListener('message', (e) => {
@@ -83,10 +99,23 @@
     return t || 'video';
   }
 
+  function keyOf(url) {
+    try { return new URL(url).pathname; } catch (_) { return url; }
+  }
+
+  function labelOf(url) {
+    try {
+      const u = new URL(url);
+      const seg = decodeURIComponent((u.pathname.split('/').pop() || 'm3u8'));
+      const res = u.searchParams.get('resolution');
+      return res ? (seg + ' · ' + res) : seg;
+    } catch (_) { return 'm3u8'; }
+  }
+
   function onCaptured(url, title) {
-    if (seen.has(url)) return;
-    seen.add(url);
-    captured.push({ url, title: cleanTitle(title) });
+    const key = keyOf(url);
+    byKey.set(key, { url, title: cleanTitle(title), label: labelOf(url) });  // 最新签名覆盖旧的
+    captured = Array.from(byKey.values());
     render();
   }
 
@@ -108,7 +137,7 @@
       'background:#fff', 'border:1px solid #e2e8f0', 'border-radius:12px',
       'box-shadow:0 6px 24px rgba(0,0,0,.18)', 'padding:11px 13px',
       'font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif',
-      'font-size:13px', 'color:#1a1a1a', 'max-width:300px',
+      'font-size:13px', 'color:#1a1a1a', 'max-width:320px',
     ].join(';');
     document.body.appendChild(box);
   }
@@ -121,15 +150,20 @@
         '<div style="margin-top:6px;font-size:12px;color:#64748b;">请点击播放视频，捕获到地址后这里会出现下载按钮</div>';
       return;
     }
-    box.innerHTML = '<div style="font-weight:700;margin-bottom:8px;">🎬 已捕获 ' + captured.length + ' 个视频流</div><div id="x2v-list"></div>';
+    const tip = captured.length === 1
+      ? '已捕获视频，点击下载：'
+      : '已捕获 ' + captured.length + ' 个，点任意一个下载：';
+    box.innerHTML = '<div style="font-weight:700;margin-bottom:8px;">🎬 ' + tip + '</div><div id="x2v-list"></div>';
     const list = box.querySelector('#x2v-list');
-    captured.forEach((item, i) => {
+    captured.forEach((item) => {
       const btn = document.createElement('button');
-      btn.textContent = '⬇️ 发送 #' + (i + 1) + (i === captured.length - 1 ? '（最新）' : '');
+      btn.textContent = '⬇️ ' + item.label;
+      btn.title = item.url;
       btn.style.cssText = [
         'display:block', 'width:100%', 'margin-top:6px', 'padding:8px 10px',
         'border:0', 'border-radius:8px', 'background:#07c160', 'color:#fff',
         'font-weight:600', 'font-size:12px', 'cursor:pointer', 'text-align:left',
+        'white-space:nowrap', 'overflow:hidden', 'text-overflow:ellipsis',
       ].join(';');
       btn.addEventListener('click', () => sendToLocal(item));
       list.appendChild(btn);
