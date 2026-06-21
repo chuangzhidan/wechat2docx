@@ -107,6 +107,32 @@ python3 video_download.py "<真实m3u8地址>" -o downloads -t 文件名 [--cook
 
 ---
 
+## 后台常驻服务（macOS，关掉终端/VSCode 也不停、开机自启）
+
+用 launchd 把服务装成"像后台 Mac 程序"一样常驻。
+
+> ⚠️ 注意：项目**不能放在 `~/Documents`、`~/Desktop`、`~/Downloads`** 这些被 macOS 隐私保护(TCC)的目录，否则后台进程无权访问会报 `Operation not permitted`。本项目放在 `~/wechat2docx`。
+
+- 启动脚本：[`start_service.sh`](start_service.sh)（cd 到项目目录并用 pyenv 3.12.3 的 python 启动）
+- LaunchAgent 配置：`~/Library/LaunchAgents/com.wechat2docx.app.plist`（`RunAtLoad` 登录自启 + `KeepAlive` 崩溃自拉起）
+
+**常用管理命令**（`UID` 用 `id -u` 的值，一般是 501）：
+```bash
+# 启动 / 装入（首次或修改 plist 后）
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.wechat2docx.app.plist
+# 停止 / 卸载
+launchctl bootout   gui/$(id -u)/com.wechat2docx.app
+# 立即重启
+launchctl kickstart -k gui/$(id -u)/com.wechat2docx.app
+# 查看状态
+launchctl print gui/$(id -u)/com.wechat2docx.app | grep -E 'state|pid'
+# 看日志
+tail -f ~/wechat2docx/service.out.log
+```
+装好后浏览器访问 **https://localhost:5001**（建议加书签）。自签证书首次访问点「高级 → 继续前往」。
+
+---
+
 ## 目录结构（核心）
 ```
 wechat2docx/
@@ -116,6 +142,7 @@ wechat2docx/
 ├── doc2md.py                 # 通用文件 → Markdown CLI
 ├── browser_helper/
 │   └── xiaoe_capture.user.js # 油猴一键抓取脚本
+├── start_service.sh          # launchd 后台服务启动脚本
 ├── requirements.txt
 └── downloads/                # 视频下载输出（已 gitignore）
 ```
