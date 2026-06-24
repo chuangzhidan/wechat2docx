@@ -21,7 +21,7 @@ import tempfile
 from contextvars import ContextVar
 from concurrent.futures import ThreadPoolExecutor, wait as futures_wait, FIRST_COMPLETED
 from io import BytesIO
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, parse_qsl, urlencode, urlunparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -60,7 +60,7 @@ DEFAULT_HEADERS = {
     )
 }
 
-SUPPORTED_BODY_FONTS = ("宋体", "宋体-简", "Times New Roman", "楷体")
+SUPPORTED_BODY_FONTS = ("宋体", "宋体-简", "Times New Roman", "楷体", "方正仿宋_GBK")
 DEFAULT_BODY_FONT = "宋体-简"
 DEFAULT_BODY_FONT_SIZE_PT = 10.5
 
@@ -118,11 +118,38 @@ def _set_run_font(run, font_name: str):
     _set_rfonts(run._element.get_or_add_rPr(), font_name)
 
 
+# 微信分享链接里常见的跟踪参数，会触发「访问验证」反爬页面，抓取前需剔除
+_WECHAT_TRACKING_PARAMS = {
+    "click_id", "poc_token", "scene", "from", "isappinstalled",
+    "clicktime", "enterid", "ascene", "devicetype", "version",
+    "nettype", "abtest_cookie", "key", "uin", "pass_ticket", "wx_header",
+}
+
+
+def _clean_wechat_url(url: str) -> str:
+    """剔除微信文章 URL 中触发反爬验证页的跟踪参数。
+
+    /s/<token> 形式：query 全是跟踪参数，整体丢弃。
+    /s?__biz=...&mid=...&sn=... 形式：query 是定位文章的必要参数，仅剔除已知跟踪参数。
+    """
+    parsed = urlparse(url)
+    if "mp.weixin.qq.com" not in parsed.netloc:
+        return url
+    # 路径形式 /s/<token>：query 仅为跟踪参数，直接清空
+    if parsed.path.startswith("/s/") and len(parsed.path) > len("/s/"):
+        return urlunparse(parsed._replace(query="", fragment=""))
+    # 查询形式 /s?__biz=...：保留必要参数，仅去掉已知跟踪参数
+    kept = [(k, v) for k, v in parse_qsl(parsed.query, keep_blank_values=True)
+            if k not in _WECHAT_TRACKING_PARAMS]
+    return urlunparse(parsed._replace(query=urlencode(kept), fragment=""))
+
+
 def fetch_article(url: str) -> BeautifulSoup:
     """抓取文章页面，自动识别微信/CSDN，并把 URL 存到 soup._url"""
     # 雪球：所有接口被阿里云 WAF JS Challenge 保护，requests 无法通过
     if 'xueqiu.com' in url:
         raise ValueError("雪球暂不支持：其页面受 WAF JS 挑战保护，需要浏览器环境才能访问，无法用 requests 抓取")
+    url = _clean_wechat_url(url)
     is_csdn = 'blog.csdn.net' in url
     headers = dict(DEFAULT_HEADERS)
     if is_csdn:
@@ -983,6 +1010,8 @@ def _build_docx_impl(soup: BeautifulSoup, meta: dict, output: str, comments: lis
             doc.save(output)
             print(f"  正文：图片合集，提取文字 {written} 段 → {output}", file=sys.stderr)
             return
+        elif soup.find("link", href=re.compile("secitptpage")) or soup.find(id="js_verify"):
+            reason = "微信触发了访问验证（反爬虫）页面，请稍后重试，或检查链接是否带有多余的跟踪参数"
         elif "轻触阅读原文" in body_text or "阅读原文" in body_text:
             reason = "外链跳转卡片（内容在外部网站，无正文可抓取）"
         else:

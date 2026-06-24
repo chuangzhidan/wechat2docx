@@ -294,6 +294,7 @@ HTML = """
           <option value="宋体">宋体</option>
           <option value="Times New Roman">Times New Roman</option>
           <option value="楷体">楷体</option>
+          <option value="方正仿宋_GBK">方正仿宋_GBK</option>
         </select>
       </div>
       <div class="option-field">
